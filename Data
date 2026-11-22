@@ -1,0 +1,420 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "22c838e5-5da2-4aab-9398-c8a00ec0db93",
+   "metadata": {},
+   "source": [
+    "# Data collection (raw)\n",
+    "\n",
+    "Sources: **yfinance**, **FRED** (no API key required) and **Cboe** (VIX).\n",
+    "This notebook only downloads the data and saves it to the `data/raw/` folder.\n",
+    "Missing values (NaN) are **not filled** here; cleaning is done in a separate step (`data/processed/`).\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "id": "991615d8",
+   "metadata": {
+    "vscode": {
+     "languageId": "plaintext"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Output folder: C:\\Users\\User\\Documents\\Diploma\\data\\raw\n"
+     ]
+    }
+   ],
+   "source": [
+    "# !pip install yfinance openpyxl\n",
+    "from datetime import timedelta\n",
+    "from pathlib import Path\n",
+    "from io import StringIO\n",
+    "import requests\n",
+    "import time\n",
+    "\n",
+    "import pandas as pd\n",
+    "import yfinance as yf\n",
+    "\n",
+    "\n",
+    "# Settings \n",
+    "START = \"2000-01-01\"\n",
+    "END = \"2026-11-01\"     # inclusive\n",
+    "\n",
+    "# Tickers for yfinance\n",
+    "TICKERS = [\"^GSPC\", \"^IXIC\", \"^DJI\", \"^VIX\"]\n",
+    "\n",
+    "# FRED series (fredgraph.csv endpoint, no API key needed)\n",
+    "FRED_SERIES = {\n",
+    "    \"VIXCLS\":   \"VIX closing value\",\n",
+    "    \"DGS2\":     \"2-year Treasury yield\",\n",
+    "    \"DGS10\":    \"10-year Treasury yield\",\n",
+    "    \"DFF\":      \"Federal Funds Effective Rate\",\n",
+    "    \"CPIAUCSL\": \"CPI (monthly)\",\n",
+    "}\n",
+    "\n",
+    "CBOE_VIX_URL = \"https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv\"\n",
+    "\n",
+    "SAVE_CSV = True\n",
+    "SAVE_EXCEL = False          # set to True to also save .xlsx (requires openpyxl)\n",
+    "\n",
+    "# Paths \n",
+    "ROOT = Path.cwd().parent if Path.cwd().name == \"notebooks\" else Path.cwd()\n",
+    "RAW_DIR = ROOT / \"data\" / \"raw\"\n",
+    "RAW_DIR.mkdir(parents=True, exist_ok=True)\n",
+    "print(\"Output folder:\", RAW_DIR.resolve())\n",
+    "\n",
+    "\n",
+    "def save_raw(df: pd.DataFrame, name: str) -> None:\n",
+    "    \"\"\"Save a DataFrame to data/raw/. The Date index is kept as a column.\"\"\"\n",
+    "    if SAVE_CSV:\n",
+    "        df.to_csv(RAW_DIR / f\"{name}.csv\", index=True)\n",
+    "    if SAVE_EXCEL:\n",
+    "        df.to_excel(RAW_DIR / f\"{name}.xlsx\", index=True)\n",
+    "    print(f\"{name}: {df.shape[0]} rows, {df.index.min().date()} -> {df.index.max().date()}, NaN: {int(df.isna().sum().sum())}\")\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "d64c3976-c0cc-465c-99ca-f1308049ebab",
+   "metadata": {},
+   "source": [
+    "## 1. yfinance"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 10,
+   "id": "332419d9-5a68-4bf9-a788-1a5331a65f7e",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "GSPC_yf_raw: 6748 rows, 2000-01-03 -> 2026-10-30, NaN: 0\n",
+      "IXIC_yf_raw: 6748 rows, 2000-01-03 -> 2026-10-30, NaN: 0\n",
+      "DJI_yf_raw: 6748 rows, 2000-01-03 -> 2026-10-30, NaN: 0\n",
+      "VIX_yf_raw: 6750 rows, 2000-01-03 -> 2026-10-30, NaN: 0\n"
+     ]
+    }
+   ],
+   "source": [
+    "# yfinance treats `end` as exclusive, so add one day\n",
+    "YF_END = (pd.Timestamp(END) + timedelta(days=1)).strftime(\"%Y-%m-%d\")\n",
+    "\n",
+    "for tk in TICKERS:\n",
+    "    df = yf.download(tk, start=START, end=YF_END, auto_adjust=False, progress=False)\n",
+    "\n",
+    "    # Recent yfinance versions return MultiIndex columns, so flatten them\n",
+    "    if isinstance(df.columns, pd.MultiIndex):\n",
+    "        df.columns = df.columns.get_level_values(0)\n",
+    "\n",
+    "    if df.empty:\n",
+    "        print(f\"{tk}: no data returned\")\n",
+    "        continue\n",
+    "\n",
+    "    df.index = pd.to_datetime(df.index)\n",
+    "    df.index.name = \"Date\"\n",
+    "    df = df.loc[START:END]\n",
+    "\n",
+    "    name = tk.replace(\"^\", \"\").replace(\"=\", \"_\") + \"_yf_raw\"\n",
+    "    save_raw(df, name)\n",
+    "    "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "34ec4f46-5bc6-4fff-b4d5-a7213ea7cbd0",
+   "metadata": {},
+   "source": [
+    "## 2. FRED\n",
+    "In some FRED CSV files missing values are written as `.`, which is why `na_values=\".\"` is used when reading them."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "id": "212e6913-d868-4506-ba96-c4ed6474a715",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Downloading VIXCLS (VIX closing value)...\n",
+      "VIXCLS_fred_raw: 7000 rows, 2000-01-03 -> 2026-10-30, NaN: 218\n",
+      "  Saved VIXCLS_fred_raw (7000 rows, 0.41s)\n",
+      "Downloading DGS2 (2-year Treasury yield)...\n",
+      "DGS2_fred_raw: 7000 rows, 2000-01-03 -> 2026-10-30, NaN: 289\n",
+      "  Saved DGS2_fred_raw (7000 rows, 0.58s)\n",
+      "Downloading DGS10 (10-year Treasury yield)...\n",
+      "DGS10_fred_raw: 7000 rows, 2000-01-03 -> 2026-10-30, NaN: 289\n",
+      "  Saved DGS10_fred_raw (7000 rows, 0.44s)\n",
+      "Downloading DFF (Federal Funds Effective Rate)...\n",
+      "DFF_fred_raw: 9802 rows, 2000-01-01 -> 2026-11-01, NaN: 0\n",
+      "  Saved DFF_fred_raw (9802 rows, 0.54s)\n",
+      "Downloading CPIAUCSL (CPI (monthly))...\n",
+      "CPIAUCSL_fred_raw: 322 rows, 2000-01-01 -> 2026-10-01, NaN: 1\n",
+      "  Saved CPIAUCSL_fred_raw (322 rows, 0.22s)\n"
+     ]
+    }
+   ],
+   "source": [
+    "# FRED marks missing values with \".\" in some CSVs, hence na_values=[\".\"]\n",
+    "# Set a clear client identifier instead of a generic browser string\n",
+    "HEADERS = {\"User-Agent\": \"SP500-Forecasting-Project/1.0\"}\n",
+    "\n",
+    "for sid, desc in FRED_SERIES.items():\n",
+    "  start_time = time.time()\n",
+    "  url = f\"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}\"\n",
+    "  print(f\"Downloading {sid} ({desc})...\")\n",
+    "\n",
+    "  try:\n",
+    "    # Use a timeout so a stalled connection cannot hang the kernel indefinitely\n",
+    "    response = requests.get(url, headers=HEADERS, timeout=15)\n",
+    "    response.raise_for_status()\n",
+    "\n",
+    "    df = pd.read_csv(StringIO(response.text), na_values=[\".\"])\n",
+    "\n",
+    "    # The first column is the date (named DATE or observation_date)\n",
+    "    df = df.rename(columns={df.columns[0]: \"Date\", df.columns[1]: sid})\n",
+    "    df[\"Date\"] = pd.to_datetime(df[\"Date\"])\n",
+    "    df[sid] = pd.to_numeric(df[sid], errors=\"coerce\")\n",
+    "\n",
+    "    df = df.set_index(\"Date\").loc[START:END]\n",
+    "    save_raw(df, f\"{sid}_fred_raw\")\n",
+    "\n",
+    "    elapsed = time.time() - start_time\n",
+    "    print(f\"  Saved {sid}_fred_raw ({len(df)} rows, {elapsed:.2f}s)\")\n",
+    "  except Exception as e:\n",
+    "    elapsed = time.time() - start_time\n",
+    "    print(f\"  Failed for {sid} ({elapsed:.2f}s): {e}\")\n",
+    "\n",
+    "  # Brief pause between requests to avoid hammering the server\n",
+    "  time.sleep(0.3)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "07d891af-c1b7-4e85-8813-dfb25cba956c",
+   "metadata": {},
+   "source": [
+    "## 3. Cboe (VIX OHLC)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 12,
+   "id": "484d435f-cb60-4fa7-97c7-607eda1bb327",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "VIX_cboe_raw: 6782 rows, 2000-01-03 -> 2026-10-30, NaN: 0\n"
+     ]
+    }
+   ],
+   "source": [
+    "try:\n",
+    "    vix = pd.read_csv(CBOE_VIX_URL, storage_options=HEADERS)\n",
+    "    vix.columns = [c.strip().title() for c in vix.columns]     # DATE -> Date, CLOSE -> Close, ...\n",
+    "    vix[\"Date\"] = pd.to_datetime(vix[\"Date\"])\n",
+    "    vix = vix.set_index(\"Date\").sort_index().loc[START:END]\n",
+    "    save_raw(vix, \"VIX_cboe_raw\")\n",
+    "except Exception as e:\n",
+    "    print(\"Cboe download failed; use FRED VIXCLS or yfinance ^VIX instead:\", e)\n",
+    "    "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "6f2e1f8c-e65c-4919-b24f-e588b383aeb0",
+   "metadata": {},
+   "source": [
+    "## 4. Quick check"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 13,
+   "id": "f109858f-530a-48e9-a895-a8ee83613d1f",
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>file</th>\n",
+       "      <th>rows</th>\n",
+       "      <th>start</th>\n",
+       "      <th>end</th>\n",
+       "      <th>NaN</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>0</th>\n",
+       "      <td>CPIAUCSL_fred_raw.csv</td>\n",
+       "      <td>322</td>\n",
+       "      <td>2000-01-01</td>\n",
+       "      <td>2026-10-01</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1</th>\n",
+       "      <td>DFF_fred_raw.csv</td>\n",
+       "      <td>9802</td>\n",
+       "      <td>2000-01-01</td>\n",
+       "      <td>2026-11-01</td>\n",
+       "      <td>0</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>2</th>\n",
+       "      <td>DGS10_fred_raw.csv</td>\n",
+       "      <td>7000</td>\n",
+       "      <td>2000-01-03</td>\n",
+       "      <td>2026-10-30</td>\n",
+       "      <td>289</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3</th>\n",
+       "      <td>DGS2_fred_raw.csv</td>\n",
+       "      <td>7000</td>\n",
+       "      <td>2000-01-03</td>\n",
+       "      <td>2026-10-30</td>\n",
+       "      <td>289</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>4</th>\n",
+       "      <td>DJI_yf_raw.csv</td>\n",
+       "      <td>6748</td>\n",
+       "      <td>2000-01-03</td>\n",
+       "      <td>2026-10-30</td>\n",
+       "      <td>0</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>5</th>\n",
+       "      <td>GSPC_yf_raw.csv</td>\n",
+       "      <td>6748</td>\n",
+       "      <td>2000-01-03</td>\n",
+       "      <td>2026-10-30</td>\n",
+       "      <td>0</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>6</th>\n",
+       "      <td>IXIC_yf_raw.csv</td>\n",
+       "      <td>6748</td>\n",
+       "      <td>2000-01-03</td>\n",
+       "      <td>2026-10-30</td>\n",
+       "      <td>0</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>7</th>\n",
+       "      <td>VIX_cboe_raw.csv</td>\n",
+       "      <td>6782</td>\n",
+       "      <td>2000-01-03</td>\n",
+       "      <td>2026-10-30</td>\n",
+       "      <td>0</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>8</th>\n",
+       "      <td>VIX_yf_raw.csv</td>\n",
+       "      <td>6750</td>\n",
+       "      <td>2000-01-03</td>\n",
+       "      <td>2026-10-30</td>\n",
+       "      <td>0</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>9</th>\n",
+       "      <td>VIXCLS_fred_raw.csv</td>\n",
+       "      <td>7000</td>\n",
+       "      <td>2000-01-03</td>\n",
+       "      <td>2026-10-30</td>\n",
+       "      <td>218</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "                    file  rows       start         end  NaN\n",
+       "0  CPIAUCSL_fred_raw.csv   322  2000-01-01  2026-10-01    1\n",
+       "1       DFF_fred_raw.csv  9802  2000-01-01  2026-11-01    0\n",
+       "2     DGS10_fred_raw.csv  7000  2000-01-03  2026-10-30  289\n",
+       "3      DGS2_fred_raw.csv  7000  2000-01-03  2026-10-30  289\n",
+       "4         DJI_yf_raw.csv  6748  2000-01-03  2026-10-30    0\n",
+       "5        GSPC_yf_raw.csv  6748  2000-01-03  2026-10-30    0\n",
+       "6        IXIC_yf_raw.csv  6748  2000-01-03  2026-10-30    0\n",
+       "7       VIX_cboe_raw.csv  6782  2000-01-03  2026-10-30    0\n",
+       "8         VIX_yf_raw.csv  6750  2000-01-03  2026-10-30    0\n",
+       "9    VIXCLS_fred_raw.csv  7000  2000-01-03  2026-10-30  218"
+      ]
+     },
+     "execution_count": 13,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "# Summary of all saved raw files\n",
+    "rows = []\n",
+    "for f in sorted(RAW_DIR.glob(\"*.csv\")):\n",
+    "    d = pd.read_csv(f, index_col=\"Date\", parse_dates=True)\n",
+    "    rows.append({\n",
+    "        \"file\": f.name,\n",
+    "        \"rows\": len(d),\n",
+    "        \"start\": d.index.min().date(),\n",
+    "        \"end\": d.index.max().date(),\n",
+    "        \"NaN\": int(d.isna().sum().sum()),\n",
+    "    })\n",
+    "pd.DataFrame(rows)\n"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.13.5"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
